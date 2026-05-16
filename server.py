@@ -1,33 +1,22 @@
 """
-LineCall Python backend
-=======================
-Receives JPEG frames over WebSocket, detects ball, calls IN/OUT.
-Supports both AUTO court detection and manual calibration.
-
-Install:
-    pip install fastapi uvicorn[standard] opencv-python-headless ultralytics numpy filterpy
-
-Run:
-    python server.py
+LineCall backend v3 — reescrito para mayor precisión
+- Detección de bounce más robusta (umbral de velocidad vertical)
+- Calibración manual mejorada con zoom en las esquinas
+- Auto-detect simplificado y más conservador
+- OUT solo se llama cuando el bounce es claro y fuera de líneas
 """
 
-import asyncio, base64, json, logging
+import asyncio, base64, json, logging, os
 import numpy as np
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from filterpy.kalman import KalmanFilter
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("linecall")
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Ball detector ─────────────────────────────────────────
 class BallDetector:
@@ -38,213 +27,234 @@ class BallDetector:
             self.model = YOLO("yolov8n.pt")
             log.info("YOLOv8 loaded")
         except Exception as e:
-            log.warning(f"YOLOv8 not available ({e}) — using mock detector")
-
-        self._x  = 300.0
-        self._y  = 250.0
-        self._vx = 4.5
-        self._vy = -6.0
+            log.warning(f"YOLOv8 not available: {e}")
 
     def detect(self, frame: np.ndarray):
+        """Returns (cx, cy, confidence) or None."""
         if self.model is not None:
-            results = self.model(frame, classes=[32], conf=0.35, verbose=False)
+            results = self.model(frame, classes=[32], conf=0.3, verbose=False)
             boxes   = results[0].boxes
             if boxes is not None and len(boxes) > 0:
                 best = boxes[boxes.conf.argmax()]
                 x1,y1,x2,y2 = best.xyxy[0].tolist()
-                return ((x1+x2)/2, (y1+y2)/2)
+                conf = float(best.conf[0])
+                return ((x1+x2)/2, (y1+y2)/2, conf)
+        return None
 
-        h, w = frame.shape[:2]
-        self._vy += 0.3
-        self._x  += self._vx
-        self._y  += self._vy
-        if self._x <= 20 or self._x >= w-20: self._vx *= -1
-        if self._y >= h-20:
-            self._y  = h-20
-            self._vy = -abs(self._vy) * 0.85
-        if self._y <= 20:
-            self._y  = 20
-            self._vy = abs(self._vy) * 0.85
-        import random
-        if random.random() < 0.003:
-            self._vx += random.uniform(-2, 2)
-        return (float(self._x), float(self._y))
-
-# ── Auto court detector ───────────────────────────────────
-class AutoCourtDetector:
-    """
-    Detects pickleball court lines automatically using:
-    1. Color segmentation (green court surface)
-    2. Hough line detection
-    3. Finds the 4 outer corners from intersecting lines
-    """
-
-    def detect(self, frame: np.ndarray):
-        """
-        Returns list of 4 corner points [[x,y]x4] in order
-        TL, TR, BR, BL — or None if court not found.
-        """
-        h, w = frame.shape[:2]
-
-        # ── Step 1: find court surface by color ──────────
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # Green court (outdoor / indoor green)
-        green_lo = np.array([35, 40, 40])
-        green_hi = np.array([85, 255, 255])
-        mask_green = cv2.inRange(hsv, green_lo, green_hi)
-
-        # Blue court (many indoor courts are blue)
-        blue_lo = np.array([100, 40, 40])
-        blue_hi = np.array([130, 255, 255])
-        mask_blue = cv2.inRange(hsv, blue_lo, blue_hi)
-
-        # Teal/cyan court
-        teal_lo = np.array([80, 40, 40])
-        teal_hi = np.array([100, 255, 255])
-        mask_teal = cv2.inRange(hsv, teal_lo, teal_hi)
-
-        court_mask = cv2.bitwise_or(mask_green, cv2.bitwise_or(mask_blue, mask_teal))
-
-        # Clean up mask
-        kernel = np.ones((5,5), np.uint8)
-        court_mask = cv2.morphologyEx(court_mask, cv2.MORPH_CLOSE, kernel)
-        court_mask = cv2.morphologyEx(court_mask, cv2.MORPH_OPEN,  kernel)
-
-        # ── Step 2: find largest contour (the court) ─────
-        contours, _ = cv2.findContours(court_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        largest = max(contours, key=cv2.contourArea)
-        area    = cv2.contourArea(largest)
-
-        # Court must be at least 15% of frame
-        if area < w * h * 0.15:
-            return None
-
-        # ── Step 3: approximate polygon ──────────────────
-        peri    = cv2.arcLength(largest, True)
-        approx  = cv2.approxPolyDP(largest, 0.02 * peri, True)
-
-        # We want 4 corners
-        if len(approx) < 4:
-            return None
-
-        # Get bounding corners from convex hull
-        hull   = cv2.convexHull(largest)
-        rect   = cv2.minAreaRect(hull)
-        corners= cv2.boxPoints(rect)
-        corners= corners.astype(np.float32)
-
-        # ── Step 4: order corners TL→TR→BR→BL ────────────
-        corners = self._order_corners(corners)
-        return corners.tolist()
-
-    def _order_corners(self, pts):
-        """Sort 4 points into TL, TR, BR, BL order."""
-        pts  = pts.reshape(4, 2)
-        rect = np.zeros((4, 2), dtype=np.float32)
-
-        # TL = smallest sum, BR = largest sum
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]   # TL
-        rect[2] = pts[np.argmax(s)]   # BR
-
-        # TR = smallest diff, BL = largest diff
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]  # TR
-        rect[3] = pts[np.argmax(diff)]  # BL
-
-        return rect
-
-    def draw_detection(self, frame: np.ndarray, corners):
-        """Draw the detected court outline on the frame."""
-        if corners is None:
-            return frame
-        out = frame.copy()
-        pts = np.array(corners, dtype=np.int32)
-        cv2.polylines(out, [pts], True, (0, 255, 100), 3)
-        labels = ['TL','TR','BR','BL']
-        for i, (x,y) in enumerate(corners):
-            cv2.circle(out, (int(x),int(y)), 12, (0,255,100), -1)
-            cv2.putText(out, labels[i], (int(x)+14, int(y)+6),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-        return out
-
-# ── Kalman tracker ────────────────────────────────────────
+# ── Ball tracker with robust bounce detection ─────────────
 class BallTracker:
+    """
+    Tracks ball position and detects bounces.
+    Bounce = ball moving DOWN then suddenly moves UP (vy sign change)
+    Only triggers if vertical speed change is significant.
+    """
     def __init__(self):
-        kf = KalmanFilter(dim_x=4, dim_z=2)
-        kf.F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=float)
-        kf.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=float)
-        kf.R *= 8
-        kf.P *= 200
-        kf.Q[2:,2:] *= 2
-        self.kf    = kf
-        self.ready = False
-        self.prev_vy = None
+        self.positions  = []   # last N (x, y) positions
+        self.MAX_HIST   = 8
+        self.last_vy    = None
+        self.bounce_cooldown = 0  # frames to wait before next bounce
 
     def update(self, det):
+        """Returns (smoothed_pos, is_bounce) or (None, False)."""
         if det is None:
-            if self.ready: self.kf.predict()
-            return None, False, (0,0)
-        if not self.ready:
-            self.kf.x = np.array([[det[0]],[det[1]],[0],[0]], dtype=float)
-            self.ready = True
-        self.kf.predict()
-        self.kf.update(np.array([[det[0]],[det[1]]], dtype=float))
-        x,y,vx,vy = self.kf.x.flatten()
+            self.bounce_cooldown = max(0, self.bounce_cooldown - 1)
+            return None, False
+
+        x, y, conf = det
+        self.positions.append((x, y))
+        if len(self.positions) > self.MAX_HIST:
+            self.positions.pop(0)
+
+        # Need at least 4 points to estimate velocity
+        if len(self.positions) < 4:
+            return (x, y), False
+
+        # Smooth position (average of last 3)
+        recent = self.positions[-3:]
+        sx = sum(p[0] for p in recent) / len(recent)
+        sy = sum(p[1] for p in recent) / len(recent)
+
+        # Vertical velocity (positive = moving down in image coords)
+        n   = len(self.positions)
+        vy  = self.positions[-1][1] - self.positions[-3][1]
+
         bounce = False
-        if self.prev_vy is not None and self.prev_vy > 2.0 and vy < 0:
+        if (self.last_vy is not None
+                and self.last_vy > 6       # was moving down fast
+                and vy < -4                # now moving up
+                and self.bounce_cooldown == 0):
             bounce = True
-        self.prev_vy = float(vy)
-        return (float(x), float(y)), bounce, (float(vx), float(vy))
+            self.bounce_cooldown = 12  # don't trigger again for 12 frames (~0.4s)
+            log.info(f"Bounce detected at ({sx:.0f},{sy:.0f}) vy: {self.last_vy:.1f}→{vy:.1f}")
 
-# ── Court calibration + line call ─────────────────────────
+        self.last_vy = float(vy)
+        self.bounce_cooldown = max(0, self.bounce_cooldown - 1)
+        return (float(sx), float(sy)), bounce
+
+    def reset(self):
+        self.positions = []
+        self.last_vy   = None
+        self.bounce_cooldown = 0
+
+# ── Court ─────────────────────────────────────────────────
 class Court:
-    W, H, K = 6.10, 13.41, 2.235
-
-    COURT_POLY = np.array([[0,0],[6.10,0],[6.10,13.41],[0,13.41]], dtype=np.float32)
-    NVZ_NEAR   = np.array([[0,13.41-2.235],[6.10,13.41-2.235],[6.10,13.41],[0,13.41]], dtype=np.float32)
-    NVZ_FAR    = np.array([[0,0],[6.10,0],[6.10,2.235],[0,2.235]], dtype=np.float32)
+    """
+    Real pickleball court dimensions:
+    - Total: 6.10m wide x 13.41m long
+    - NVZ (kitchen): 2.235m from net each side
+    - Net at 6.705m from each baseline
+    """
+    W  = 6.10
+    H  = 13.41
+    NVZ= 2.235
 
     def __init__(self):
-        self.H_mat = None
+        self.H_mat    = None
+        self.src_pts  = None  # original pixel corners
+
+        # Court polygon in metres
+        self.court_poly = np.array([
+            [0, 0], [self.W, 0], [self.W, self.H], [0, self.H]
+        ], dtype=np.float32)
+
+        # Kitchen polygons
+        self.nvz_bottom = np.array([
+            [0, self.H - self.NVZ], [self.W, self.H - self.NVZ],
+            [self.W, self.H],        [0, self.H]
+        ], dtype=np.float32)
+        self.nvz_top = np.array([
+            [0, 0], [self.W, 0],
+            [self.W, self.NVZ], [0, self.NVZ]
+        ], dtype=np.float32)
 
     @property
     def ready(self):
         return self.H_mat is not None
 
     def calibrate(self, src_points):
+        """
+        src_points: [[x,y]×4] pixel corners in order TL→TR→BR→BL
+        Maps to real court coordinates.
+        """
         src = np.array(src_points, dtype=np.float32)
-        dst = np.array([[0,0],[self.W,0],[self.W,self.H],[0,self.H]], dtype=np.float32)
-        self.H_mat, _ = cv2.findHomography(src, dst)
-        return self.H_mat is not None
+        dst = np.array([
+            [0,        0       ],
+            [self.W,   0       ],
+            [self.W,   self.H  ],
+            [0,        self.H  ],
+        ], dtype=np.float32)
+        self.H_mat, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        self.src_pts = src
+        ok = self.H_mat is not None
+        if ok:
+            log.info(f"Court calibrated. Corners: {src_points}")
+        return ok
 
     def to_court(self, px, py):
-        pt  = np.array([[[px, py]]], dtype=np.float32)
+        """Convert pixel (px,py) → court metres (cx,cy)."""
+        pt  = np.array([[[float(px), float(py)]]], dtype=np.float32)
         res = cv2.perspectiveTransform(pt, self.H_mat)
         return float(res[0][0][0]), float(res[0][0][1])
 
     def call(self, cx, cy):
-        dist   = float(cv2.pointPolygonTest(self.COURT_POLY, (cx, cy), True))
-        result = "IN" if dist >= -0.036 else "OUT"
+        """
+        IN/OUT verdict.
+        Returns dict with result, distance in cm, court coords.
+        Tolerance: 3.6cm (ball radius) — ball is IN if centre is within tolerance.
+        """
+        # Distance from court boundary (positive=inside, negative=outside)
+        dist_m = float(cv2.pointPolygonTest(
+            self.court_poly, (cx, cy), measureDist=True
+        ))
+        # Ball is IN if centre is inside, or within 3.6cm of line
+        BALL_RADIUS_M = 0.036
+        result = "IN" if dist_m >= -BALL_RADIUS_M else "OUT"
+
         return {
             "result":  result,
-            "dist_cm": round(abs(dist) * 100, 1),
+            "dist_cm": round(abs(dist_m) * 100, 1),
             "court_x": round(cx, 3),
             "court_y": round(cy, 3),
         }
 
-    def kitchen_zone(self, cx, cy):
-        if cv2.pointPolygonTest(self.NVZ_NEAR, (cx,cy), False) >= 0: return "near"
-        if cv2.pointPolygonTest(self.NVZ_FAR,  (cx,cy), False) >= 0: return "far"
+    def in_kitchen(self, cx, cy):
+        if cv2.pointPolygonTest(self.nvz_bottom, (cx, cy), False) >= 0: return "bottom"
+        if cv2.pointPolygonTest(self.nvz_top,    (cx, cy), False) >= 0: return "top"
         return None
+
+# ── Auto court detector ───────────────────────────────────
+class AutoCourtDetector:
+    """
+    Conservative court detector.
+    Tries multiple color ranges and validates aspect ratio.
+    Returns None if not confident enough.
+    """
+    COLOR_RANGES = [
+        # Green
+        (np.array([30, 30, 40]),  np.array([90, 255, 255])),
+        # Blue
+        (np.array([95, 40, 30]),  np.array([135, 255, 255])),
+        # Teal
+        (np.array([78, 30, 30]),  np.array([102, 255, 255])),
+        # Dark blue (compressed video)
+        (np.array([90, 15, 15]),  np.array([140, 180, 200])),
+    ]
+
+    def detect(self, frame: np.ndarray):
+        h, w = frame.shape[:2]
+        min_area = w * h * 0.18  # court must be at least 18% of frame
+        max_area = w * h * 0.92
+
+        best_corners = None
+        best_score   = 0
+
+        for lo, hi in self.COLOR_RANGES:
+            hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, lo, hi)
+
+            k    = np.ones((11, 11), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts: continue
+
+            largest = max(cnts, key=cv2.contourArea)
+            area    = cv2.contourArea(largest)
+            if area < min_area or area > max_area: continue
+
+            hull  = cv2.convexHull(largest)
+            rect  = cv2.minAreaRect(hull)
+            box   = cv2.boxPoints(rect).astype(np.float32)
+
+            # Check aspect ratio
+            s0 = np.linalg.norm(box[0]-box[1])
+            s1 = np.linalg.norm(box[1]-box[2])
+            if s0 < 1 or s1 < 1: continue
+            ratio = max(s0,s1) / min(s0,s1)
+            if ratio < 1.2 or ratio > 6.0: continue
+
+            score = area  # bigger = better
+            if score > best_score:
+                best_score   = score
+                best_corners = self._order(box).tolist()
+
+        return best_corners
+
+    def _order(self, pts):
+        pts  = pts.reshape(4,2)
+        rect = np.zeros((4,2), dtype=np.float32)
+        s    = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        d    = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(d)]
+        rect[3] = pts[np.argmax(d)]
+        return rect
 
 # ── Speed calculator ──────────────────────────────────────
 class SpeedCalc:
-    def __init__(self, fps=30):
+    def __init__(self, fps=25):
         self.fps  = fps
         self.prev = None
 
@@ -258,10 +268,10 @@ class SpeedCalc:
         dist_m    = (dx**2 + dy**2) ** 0.5
         speed_kmh = dist_m * self.fps * 3.6
         self.prev = court_pos
-        if speed_kmh > 140 or speed_kmh < 1: return None
+        if speed_kmh > 160 or speed_kmh < 2: return None
         return round(speed_kmh, 1)
 
-# ── Score state machine ───────────────────────────────────
+# ── Score machine ─────────────────────────────────────────
 class Score:
     def __init__(self, doubles=True, win=11):
         self.score   = [0, 0]
@@ -286,19 +296,18 @@ class Score:
         s = self.score
         if max(s) >= self.win and abs(s[0]-s[1]) >= 2:
             self.over = True
-        return {"event": ev, "score": self.score[:],
-                "serving": self.serving, "server": self.server,
-                "game_over": self.over}
+        return {"event":ev, "score":self.score[:],
+                "serving":self.serving, "server":self.server, "game_over":self.over}
 
     def to_dict(self):
-        return {"score": self.score[:], "serving": self.serving,
-                "server": self.server, "game_over": self.over}
+        return {"score":self.score[:], "serving":self.serving,
+                "server":self.server, "game_over":self.over}
 
-# ── Shared instances ──────────────────────────────────────
+# ── Instances ─────────────────────────────────────────────
 detector      = BallDetector()
 auto_detector = AutoCourtDetector()
 
-# ── WebSocket endpoint ────────────────────────────────────
+# ── WebSocket ─────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -306,29 +315,28 @@ async def ws_endpoint(ws: WebSocket):
 
     tracker    = BallTracker()
     court      = Court()
-    speed_calc = SpeedCalc(fps=30)
+    speed_calc = SpeedCalc(fps=25)
     score      = Score()
     trail      = []
-    auto_scan_frames = 0   # count frames for auto-detection
+    auto_frames= 0
 
     async def send(data):
-        try:
-            await ws.send_text(json.dumps(data))
-        except Exception:
-            pass
+        try: await ws.send_text(json.dumps(data))
+        except: pass
 
     try:
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
 
-            # ── Manual calibration ────────────────────────
+            # ── Calibrate manually ────────────────────────
             if msg.get("type") == "calibrate":
                 ok = court.calibrate(msg["points"])
-                await send({"type": "calibrated", "ok": ok, "method": "manual"})
+                tracker.reset()
+                await send({"type":"calibrated","ok":ok,"method":"manual"})
                 continue
 
-            # ── Auto detect court ─────────────────────────
+            # ── Auto detect ───────────────────────────────
             if msg.get("type") == "auto_detect":
                 try:
                     img_bytes = base64.b64decode(msg["data"])
@@ -336,40 +344,47 @@ async def ws_endpoint(ws: WebSocket):
                     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                     if frame is not None:
                         corners = auto_detector.detect(frame)
+                        # Try with contrast enhancement if failed
+                        if not corners:
+                            enh     = cv2.convertScaleAbs(frame, alpha=1.4, beta=30)
+                            corners = auto_detector.detect(enh)
                         if corners:
                             ok = court.calibrate(corners)
+                            tracker.reset()
                             await send({
-                                "type":    "calibrated",
-                                "ok":      ok,
-                                "method":  "auto",
-                                "corners": corners,
+                                "type":"calibrated","ok":ok,
+                                "method":"auto","corners":corners
                             })
                         else:
                             await send({
-                                "type": "auto_detect_failed",
-                                "message": "Court not found. Make sure the full court is visible and well lit.",
+                                "type":"auto_detect_failed",
+                                "message":
+                                    "No se detectó la cancha.\n\n"
+                                    "Consejos:\n"
+                                    "• Pausa el video en un frame donde se vea la cancha completa\n"
+                                    "• La cancha debe ocupar al menos 20% de la imagen\n"
+                                    "• Usa Calibración Manual si el auto falla\n"
+                                    "• Asegúrate que haya buena iluminación"
                             })
                 except Exception as e:
-                    await send({"type": "auto_detect_failed", "message": str(e)})
+                    await send({"type":"auto_detect_failed","message":str(e)})
                 continue
 
             # ── Settings ──────────────────────────────────
             if msg.get("type") == "settings":
-                score = Score(
-                    doubles=msg.get("doubles", True),
-                    win=msg.get("win_score", 11)
-                )
-                await send({"type": "settings_ok"})
+                score = Score(doubles=msg.get("doubles",True), win=msg.get("win_score",11))
+                await send({"type":"settings_ok"})
                 continue
 
             # ── Reset ─────────────────────────────────────
             if msg.get("type") == "reset":
                 tracker    = BallTracker()
                 court      = Court()
-                speed_calc = SpeedCalc(fps=30)
+                speed_calc = SpeedCalc(fps=25)
                 score      = Score()
                 trail      = []
-                await send({"type": "reset_ok"})
+                auto_frames= 0
+                await send({"type":"reset_ok"})
                 continue
 
             # ── Frame ─────────────────────────────────────
@@ -381,48 +396,61 @@ async def ws_endpoint(ws: WebSocket):
                 arr   = np.frombuffer(img_bytes, np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if frame is None: continue
-            except Exception:
+            except:
                 continue
 
-            # Auto-scan first 30 frames if not calibrated
+            # Auto-scan first 90 frames (every 15)
             if not court.ready:
-                auto_scan_frames += 1
-                if auto_scan_frames <= 30 and auto_scan_frames % 10 == 0:
+                auto_frames += 1
+                if auto_frames % 15 == 0 and auto_frames <= 90:
                     corners = auto_detector.detect(frame)
                     if corners:
                         court.calibrate(corners)
+                        tracker.reset()
                         await send({
-                            "type":    "calibrated",
-                            "ok":      True,
-                            "method":  "auto",
-                            "corners": corners,
+                            "type":"calibrated","ok":True,
+                            "method":"auto","corners":corners
                         })
 
-            det              = detector.detect(frame)
-            pos, bounce, vel = tracker.update(det)
+            # Detect ball
+            det = detector.detect(frame)
 
+            # Track + bounce
+            pos, bounce = tracker.update(det)
+
+            # Trail
             if pos:
                 trail.append(list(pos))
-                if len(trail) > 24: trail.pop(0)
+                if len(trail) > 30: trail.pop(0)
 
+            # Line call — only on bounce
             court_pos    = None
             line_verdict = None
+
             if court.ready and pos:
                 try:
                     cx, cy    = court.to_court(*pos)
                     court_pos = (cx, cy)
+
                     if bounce:
-                        line_verdict = court.call(cx, cy)
-                        if line_verdict["result"] == "OUT":
+                        verdict = court.call(cx, cy)
+                        line_verdict = verdict
+
+                        # Only award point on clear OUT
+                        if verdict["result"] == "OUT":
                             ev = score.point(1 - score.serving)
                             if ev: line_verdict["score_event"] = ev
-                except Exception:
-                    pass
+
+                        log.info(
+                            f"Bounce → {verdict['result']} "
+                            f"court=({cx:.2f},{cy:.2f}) "
+                            f"dist={verdict['dist_cm']}cm"
+                        )
+                except Exception as e:
+                    log.error(f"Court transform error: {e}")
 
             speed   = speed_calc.update(court_pos, bounce)
-            kitchen = None
-            if court_pos:
-                kitchen = court.kitchen_zone(*court_pos)
+            kitchen = court.in_kitchen(*court_pos) if court_pos else None
 
             await send({
                 "type":       "state",
@@ -439,13 +467,13 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         log.info("Client disconnected")
     except Exception as e:
-        log.error(f"Error: {e}")
+        log.error(f"Session error: {e}")
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
